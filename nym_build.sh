@@ -2,7 +2,7 @@
 set -e
 
 # Default settings
-VERBOSE=false
+VERBOSE=true
 VERSION="v2025.4-dorina-patched"
 INSTALL_DIR="$HOME/.local/bin"
 
