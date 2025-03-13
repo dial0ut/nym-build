@@ -1,8 +1,8 @@
 #!/bin/bash
-set -e
 
 # Default settings
 VERBOSE=true
+SILENT=false
 VERSION="v2025.4-dorina-patched"
 INSTALL_DIR="$HOME/.local/bin"
 
@@ -11,6 +11,12 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -v|--verbose)
             VERBOSE=true
+            SILENT=false
+            shift
+            ;;
+        -s|--silent)
+            SILENT=true
+            VERBOSE=false
             shift
             ;;
         --version)
@@ -23,19 +29,24 @@ while [[ $# -gt 0 ]]; do
                 shift
             else
                 echo "Unknown parameter: $1"
-                echo "Usage: $0 [-v|--verbose] [--version VERSION]"
+                echo "Usage: $0 [-v|--verbose] [-s|--silent] [--version VERSION]"
                 exit 1
             fi
             ;;
     esac
 done
 
-# Verbose logging function
+# Logging function with silent mode
 log() {
     local level="$1"
     local message="$2"
     local color_start=""
     local color_end=""
+    
+    # Return immediately if silent mode is enabled (except for ERROR)
+    if [[ "$SILENT" == true && "$level" != "ERROR" ]]; then
+        return 0
+    fi
     
     if [[ -t 1 ]]; then  # If stdout is a terminal, use colors
         case "$level" in
@@ -47,8 +58,38 @@ log() {
         color_end="\033[0m"
     fi
     
-    if [[ "$level" != "DEBUG" ]] || $VERBOSE; then
+    if [[ "$level" != "DEBUG" ]] || [[ "$VERBOSE" == true ]]; then
         echo -e "${color_start}[$level] $message${color_end}"
+    fi
+}
+
+# Function to get user confirmation
+confirm() {
+    local prompt="$1"
+    local default="$2"
+    
+    if [[ "$SILENT" == true ]]; then
+        # In silent mode, use default answer
+        return $([ "$default" = "y" ] && echo 0 || echo 1)
+    fi
+    
+    local answer
+    read -p "$prompt [y/n] ($default): " answer
+    
+    case "${answer,,}" in
+        y|yes) return 0 ;;
+        n|no) return 1 ;;
+        *) return $([ "$default" = "y" ] && echo 0 || echo 1) ;;
+    esac
+}
+
+# POSIX-compliant check if nym-client exists in PATH
+check_nym_client_exists() {
+    if command -v nym-client >/dev/null 2>&1; then
+        log "INFO" "nym-client is already installed at $(command -v nym-client)"
+        return 0
+    else
+        return 1
     fi
 }
 
@@ -72,7 +113,7 @@ detect_system() {
     esac
     
     log "INFO" "Detected system: $OS ($ARCH)"
-    $VERBOSE && log "DEBUG" "uname -a: $(uname -a)"
+    [[ "$VERBOSE" == true ]] && log "DEBUG" "uname -a: $(uname -a)"
 }
 
 # Find latest version if needed
@@ -85,11 +126,12 @@ get_latest_version() {
                         sed 's/nym-binaries-//')
         if [[ -z "$LATEST_VERSION" ]]; then
             log "ERROR" "Failed to determine latest version"
-            exit 1
+            return 1
         fi
         VERSION="$LATEST_VERSION"
     fi
     log "INFO" "Using version: $VERSION"
+    return 0
 }
 
 # Download hash file and verify
@@ -102,7 +144,7 @@ verify_binary() {
     log "INFO" "Downloading hash file from $hash_url"
     if ! curl -fsSL "$hash_url" -o "$hash_file"; then
         log "WARN" "Could not download hash file for verification"
-        return
+        return 0
     fi
 
     # Calculate hash of binary
@@ -112,10 +154,10 @@ verify_binary() {
         HASH=$(shasum -a 256 "$binary" | cut -d ' ' -f 1)
     else
         log "WARN" "No SHA-256 utility found, skipping hash verification"
-        return
+        return 0
     fi
 
-    log "DEBUG" "Binary hash: $HASH"
+    [[ "$VERBOSE" == true ]] && log "DEBUG" "Binary hash: $HASH"
     
     # Verify hash against json file
     if command -v jq >/dev/null; then
@@ -125,7 +167,7 @@ verify_binary() {
             log "INFO" "Hash verification successful!"
         else
             log "ERROR" "Hash verification failed! Binary may be compromised."
-            exit 1
+            return 1
         fi
     else
         # Fallback if jq not available
@@ -135,6 +177,7 @@ verify_binary() {
             log "WARN" "Hash not found in file. Verification cannot be completed without jq"
         fi
     fi
+    return 0
 }
 
 # Download pre-compiled binary
@@ -153,18 +196,38 @@ download_binary() {
     fi
 }
 
+# Check for Rust toolchain
+check_rust() {
+    if ! command -v rustc >/dev/null 2>&1; then
+        log "INFO" "Rust not found"
+        if confirm "Do you want to install Rust?" "y"; then
+            log "INFO" "Installing Rust..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            log "INFO" "Rust installed successfully"
+        else
+            log "ERROR" "Rust is required to build nym-client from source"
+            return 1
+        fi
+    else
+        RUST_VERSION=$(rustc --version)
+        log "INFO" "Rust found: $RUST_VERSION"
+        if confirm "Do you want to update Rust toolchain?" "y"; then
+            log "INFO" "Updating Rust toolchain..."
+            rustup update
+            log "INFO" "Rust updated successfully"
+        fi
+    fi
+    return 0
+}
+
 # Build from source for non-x86 architectures
 build_from_source() {
     log "INFO" "Building nym-client from source for $ARCH architecture"
     
     # Check for Rust toolchain
-    if ! command -v rustc >/dev/null; then
-        log "INFO" "Rust not found. Installing..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source "$HOME/.cargo/env"
-    else
-        log "INFO" "Updating Rust toolchain"
-        rustup update
+    if ! check_rust; then
+        return 1
     fi
     
     cd "${TEMP_DIR}"
@@ -195,6 +258,14 @@ build_from_source() {
 
 # Main installation function
 install_nym_client() {
+    # Check if nym-client already exists
+    if check_nym_client_exists; then
+        if ! confirm "nym-client is already installed. Install anyway?" "n"; then
+            log "INFO" "Installation cancelled"
+            exit 0
+        fi
+    fi
+    
     # Create temporary directory
     TEMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -203,7 +274,7 @@ install_nym_client() {
     
     # Get system information
     detect_system
-    get_latest_version
+    get_latest_version || exit 1
     
     # Install based on architecture
     if [[ "$ARCH" == "x86_64" || "$ARCH" == "x86" ]]; then
